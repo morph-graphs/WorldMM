@@ -595,6 +595,19 @@ class HippoRAG:
             all_openie_info = []
             chunk_keys_to_save = chunk_keys
 
+        # EPIC-Morph port: rows for the requested passages that are missing here come from a precomputed file
+        # (openie_source_path, set by WorldMM's EpisodicMemory), instead of new OpenIE calls. Only the requested
+        # passages are taken, so nothing beyond what is being indexed enters the graph.
+        source = getattr(self, "openie_source_path", None)
+        if chunk_keys_to_save and source and os.path.isfile(source):
+            wanted = set(chunk_keys_to_save)
+            for openie_info in json.load(open(source)).get('docs', []):
+                openie_info['idx'] = compute_mdhash_id(openie_info['passage'], 'chunk-')
+                if openie_info['idx'] in wanted:
+                    all_openie_info.append(openie_info)
+                    wanted.discard(openie_info['idx'])
+            chunk_keys_to_save = wanted
+
         return all_openie_info, chunk_keys_to_save
 
     def merge_openie_results(self,

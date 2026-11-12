@@ -9,6 +9,7 @@ from .VLM2Vec.src.arguments import ModelArguments, DataArguments
 from .VLM2Vec.src.model.model import MMEBModel
 from .VLM2Vec.src.model.processor import load_processor, QWEN2_VL, VLM_IMAGE_TOKENS, VLM_VIDEO_TOKENS, Qwen2_VL_process_fn
 from .VLM2Vec.src.utils import batch_to_device
+from ..model_path import resolve_model_path
 from .VLM2Vec.src.model.vlm_backbone.qwen2_vl.qwen_vl_utils import process_vision_info
 
 
@@ -49,7 +50,7 @@ class VLM2VecV2EmbeddingModel:
         """Load the VLM2Vec V2.0 model and processor"""
         # Set up model arguments
         model_args = ModelArguments(
-            model_name=self.model_name,
+            model_name=resolve_model_path(self.model_name),
             pooling=self.pooling,
             normalize=self.normalize,
             model_backbone='qwen2_vl',

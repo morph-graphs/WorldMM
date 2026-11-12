@@ -552,6 +552,8 @@ Step 2 (only if search): Pick one memory type (episodic/semantic/visual) and for
                     "search_query": search_query,
                     "retrieved_content": content if content else "[No results]",
                 })
+                if memory_type == "visual":   # EPIC-Morph port: which clips (time ranges), for evidence scoring
+                    round_history[-1]["retrieved_clips"] = list(images.keys()) if images else []
         
         # Generate final answer
         logger.info("Generating answer from accumulated context")

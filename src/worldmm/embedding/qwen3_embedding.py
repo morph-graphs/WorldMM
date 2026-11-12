@@ -1,6 +1,9 @@
+import os
 from typing import Union, List
 import numpy as np
 from sentence_transformers import SentenceTransformer
+
+from ..model_path import resolve_model_path
 
 
 class Qwen3EmbeddingModel:
@@ -11,7 +14,7 @@ class Qwen3EmbeddingModel:
         self.device = device
         
         self.model = SentenceTransformer(
-            model_name,
+            resolve_model_path(model_name),
             model_kwargs={"attn_implementation": "flash_attention_2", "dtype": "auto", "device_map": device},
             tokenizer_kwargs={"padding_side": "left"},
         )
@@ -21,6 +24,9 @@ class Qwen3EmbeddingModel:
         if isinstance(texts, str):
             texts = [texts]
         
+        # WORLDMM_EMB_BATCH caps the batch (memory only, same embeddings): 256 OOMs a 16 GB GPU on long videos
+        if os.environ.get("WORLDMM_EMB_BATCH"):
+            batch_size = min(batch_size, int(os.environ["WORLDMM_EMB_BATCH"]))
         embeddings = self.model.encode(texts, batch_size=batch_size)
         return embeddings
     

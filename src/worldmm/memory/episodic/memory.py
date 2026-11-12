@@ -4,6 +4,7 @@ Episodic Memory module for WorldMM.
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Any, Optional, Tuple, Union
 from dataclasses import dataclass
 
@@ -116,6 +117,11 @@ class EpisodicMemory:
         # Track indexed entries (entries that have been indexed up to indexed_time)
         self.indexed_entries: Dict[str, List[CaptionEntry]] = {g: [] for g in self.granularities}
         self.indexed_time: int = 0  # 0 means nothing indexed yet
+
+        # EPIC-Morph port (strict streaming): granularity -> a HippoRAG OpenIE results file computed once for the
+        # whole video. HippoRAG reads rows from it only for the passages it is indexing, so a question's graph
+        # never holds a caption that ends after its time, and the OpenIE LLM calls are not repeated per question.
+        self.openie_sources: Dict[str, str] = {}
     
     def _get_or_create_hipporag(self, granularity: str) -> HippoRAG:
         """Get or create HippoRAG instance for a granularity level."""
@@ -124,6 +130,8 @@ class EpisodicMemory:
                 save_dir=f"{self.save_dir_root}/{granularity}",
                 llm_model=self.llm_model,
                 embedding_model=self.embedding_model)
+            if granularity in self.openie_sources:
+                self.hipporag[granularity].openie_source_path = self.openie_sources[granularity]
         return self.hipporag[granularity]
     
     def load_captions_from_files(
@@ -282,24 +290,21 @@ class EpisodicMemory:
         
         # Retrieve from each granularity level using HippoRAG
         all_candidates: List[Tuple[CaptionEntry, float]] = []
-        
-        for granularity in self.granularities:
-            if granularity not in self.hipporag:
-                continue
-            
-            # Get top_k for this granularity
+
+        def granularity_top_k(granularity):
             if isinstance(top_k_per_granularity, dict):
-                granularity_top_k = top_k_per_granularity.get(granularity, 5)  # default to 5 if not specified
-            else:
-                granularity_top_k = top_k_per_granularity
-            
-            hipporag = self.hipporag[granularity]
-            
-            retrieval_result = hipporag.retrieve(
-                queries=[query], 
-                num_to_retrieve=granularity_top_k
-            )
-            
+                return top_k_per_granularity.get(granularity, 5)  # default to 5 if not specified
+            return top_k_per_granularity
+
+        # EPIC-Morph port: the granularities' HippoRAG searches are independent and each makes one LLM rerank
+        # call, so they run in threads (a batching LLM server answers them together) instead of one after
+        # another; the candidates are assembled in the same granularity order as upstream.
+        granularities = [g for g in self.granularities if g in self.hipporag]
+        with ThreadPoolExecutor(max_workers=max(1, len(granularities))) as ex:
+            results = list(ex.map(lambda g: self.hipporag[g].retrieve(queries=[query], num_to_retrieve=granularity_top_k(g)),
+                                  granularities))
+
+        for granularity, retrieval_result in zip(granularities, results):
             if not retrieval_result or not retrieval_result[0].docs:
                 continue
             
@@ -309,7 +314,7 @@ class EpisodicMemory:
             
             count = 0
             for doc_text, score in zip(retrieved_docs, retrieved_scores):
-                if count >= granularity_top_k:
+                if count >= granularity_top_k(granularity):
                     break
                 
                 # Look up the CaptionEntry from text

@@ -434,9 +434,12 @@ class VisualMemory:
             logger.error(str(e))
             return []
         
+        # EPIC-Morph port: only indexed clips, and nothing past the indexed time (upstream scanned every
+        # loaded clip, so a range past the question time returned frames from the future)
+        end_ts = min(end_ts, self.indexed_time)
         # Find all clips that overlap with the time range
         matching_clips = []
-        for clip in self.clips:
+        for clip in self.indexed_entries:
             clip_start, clip_end = clip.timestamp_int
             # Check if clip overlaps with the query time range
             if clip_start <= end_ts and clip_end >= start_ts:
@@ -463,6 +466,11 @@ class VisualMemory:
             # We need to calculate seconds from clip start
             start_sec = self._timestamp_diff_seconds(clip_start, overlap_start)
             end_sec = self._timestamp_diff_seconds(clip_start, overlap_end)
+            # EPIC-Morph port: offsets into the video file are absolute, as in _retrieve_by_similarity (our clips
+            # are segments of one long video file)
+            if clip.clip_start_sec is not None:
+                start_sec += clip.clip_start_sec
+                end_sec += clip.clip_start_sec
             
             frames = self._extract_frames(
                 clip.video_path,

@@ -8,6 +8,8 @@ import copy
 import json
 import logging
 import os
+import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -19,6 +21,7 @@ from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
 from .utils import dynamic_retry_decorator
+from ..model_path import resolve_model_path
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -28,7 +31,28 @@ MODEL_DICT = {
     "qwen3vl-2b": "Qwen/Qwen3-VL-2B-Instruct",
     "qwen3vl-4b": "Qwen/Qwen3-VL-4B-Instruct",
     "qwen3vl-8b": "Qwen/Qwen3-VL-8B-Instruct",
+    # EPIC-Morph port: Qwen3.8-27B (instruct mode), served only through WORLDMM_SERVER (needs transformers 5.8)
+    "qwen38-27b": "Qwen/Qwen3.8-27B",
 }
+
+# EPIC-Morph port: with WORLDMM_SERVER set (a unix socket of baselines/worldmm/epic/llm_server.py in morph_graph),
+# no model is loaded here; generate() keeps this wrapper's prompt preprocessing and output parsing but sends
+# the messages to that server, which batches the concurrent calls of every LLMModel in the process (WorldMM
+# calls its LLM from many threads) and can run another transformers version (Qwen3.8 needs 5.x).
+_server_local = threading.local()
+
+
+def _server_call(messages, max_new_tokens):
+    from multiprocessing.connection import Client
+    conn = getattr(_server_local, "conn", None)
+    if conn is None:
+        conn = _server_local.conn = Client(os.environ["WORLDMM_SERVER"], family="AF_UNIX",
+                                           authkey=os.environ.get("WORLDMM_AUTHKEY", "worldmm").encode())
+    conn.send({"messages": messages, "max_new_tokens": max_new_tokens})
+    out = conn.recv()
+    if "error" in out:
+        raise Qwen3VLModelError(out["error"])
+    return out["text"]
 
 
 class Qwen3VLModelError(Exception):
@@ -96,16 +120,19 @@ class Qwen3VLModel:
 
     def _init_model(self) -> None:
         """Initialize the model and processor."""
+        if os.environ.get("WORLDMM_SERVER"):   # generation goes to the server (see _server_call)
+            self.model = self.processor = None
+            return
         # Load model
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-            self.model_name,
+            resolve_model_path(self.model_name),
             torch_dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
             device_map="auto",
         )
         
         # Load processor
-        self.processor = AutoProcessor.from_pretrained(self.model_name)
+        self.processor = AutoProcessor.from_pretrained(resolve_model_path(self.model_name))
 
     def _validate_file_path(self, file_path: Union[str, Path]) -> Path:
         """Validate and convert file path to Path object."""
@@ -355,6 +382,10 @@ class Qwen3VLModel:
         messages = self._preprocess_prompt(prompt_copy)
         
         try:
+            if self.model is None:   # WORLDMM_SERVER
+                result = _server_call(messages, {**self.kwargs, **kwargs}.get("max_new_tokens", 2048)).strip()
+                return self._parse_structured_response(result, text_format) if text_format is not None else result
+
             # Prepare text for Qwen3VL processor
             text = self.processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
@@ -489,49 +520,65 @@ class Qwen3VLModel:
     def _parse_structured_response(self, response: str, text_format: type) -> Any:
         """
         Parse the response string using the provided text_format (Pydantic model).
-        
-        Args:
-            response: The raw response string from the model
-            text_format: Pydantic model class for parsing
-            
-        Returns:
-            Parsed object of type text_format
-            
+
+        EPIC-Morph port: tolerant of the shapes a local Qwen returns without schema-constrained decoding
+        (upstream only strips a leading ```json fence). The NER and triple prompts say "Respond with a JSON
+        list", so Qwen often returns a bare list (GPT-5 gets the schema through the API instead). Here: take the
+        first JSON value in the reply (fences or prose around it allowed); a list, when the schema has exactly
+        one field and it is a list (NerRawOutput.named_entities, TripleRawOutput.triples), becomes that field;
+        non-string scalars inside string-list fields (e.g. ["faucet", "is on", true]) are made strings.
+
         Raises:
             Qwen3VLModelError: If parsing fails
         """
+        from typing import get_origin
+        text = re.sub(r"```(?:json)?", "", response).strip()
+        data = None
         try:
-            # Clean the response by removing markdown code blocks if present
-            cleaned_response = response.strip()
-            if cleaned_response.startswith('```json'):
-                cleaned_response = cleaned_response[7:]
-            if cleaned_response.endswith('```'):
-                cleaned_response = cleaned_response[:-3]
-            cleaned_response = cleaned_response.strip()
-            
-            # Try to parse as JSON first
-            json_data = json.loads(cleaned_response)
-            
-            # If it's a Pydantic model, use model_validate (Pydantic v2)
-            if hasattr(text_format, 'model_validate'):
-                return text_format.model_validate(json_data)
-            # Fallback for older Pydantic versions
-            elif hasattr(text_format, 'parse_obj'):
-                return text_format.parse_obj(json_data)
-            else:
-                logger.warning(f"Unsupported text_format type: {text_format}")
-                raise ValueError("text_format must be a Pydantic model class")
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse response as JSON: {response}")
-            raise Qwen3VLModelError(f"Failed to parse response as JSON: {e}") from e
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            dec = json.JSONDecoder()
+            for m in re.finditer(r"[\[{]", text):
+                try:
+                    data = dec.raw_decode(text[m.start():])[0]
+                    break
+                except json.JSONDecodeError:
+                    continue
+        if data is None:
+            logger.warning(f"No JSON in {len(response)}-char reply: {response[:150]!r} ... {response[-150:]!r}")
+            raise Qwen3VLModelError(f"Failed to parse response as JSON: {response[:200]!r}")
+        fields = text_format.model_fields
+        if isinstance(data, list) and len(fields) == 1:
+            (name, field), = fields.items()
+            if get_origin(field.annotation) in (list, List):
+                data = {name: data}
+        try:
+            return text_format.model_validate(data)
+        except Exception:
+            pass
+        if isinstance(data, dict):
+            data = dict(data)
+            for k, f in fields.items():
+                if k in data and isinstance(data[k], list) and "str" in str(f.annotation):
+                    data[k] = _strify(data[k])
+        try:
+            return text_format.model_validate(data)
         except Exception as e:
-            logger.error(f"Failed to parse structured response: {e}")
+            logger.warning(f"{text_format.__name__} validation failed on {len(response)}-char reply: {str(e)[:200]}")
             raise Qwen3VLModelError(f"Failed to parse structured response: {e}") from e
 
     def __repr__(self) -> str:
         """String representation of the model instance."""
         return (f"Qwen3VLModel(model_name='{self.model_name}', "
                 f"kwargs={self.kwargs})")
+
+
+def _strify(x):
+    if isinstance(x, list):
+        return [_strify(y) for y in x]
+    if isinstance(x, bool) or x is None:
+        return json.dumps(x)
+    return x if isinstance(x, str) else str(x)
 
 
 # Convenience function
