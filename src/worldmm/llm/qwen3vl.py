@@ -524,8 +524,9 @@ class Qwen3VLModel:
         EPIC-Morph port: tolerant of the shapes a local Qwen returns without schema-constrained decoding
         (upstream only strips a leading ```json fence). The NER and triple prompts say "Respond with a JSON
         list", so Qwen often returns a bare list (GPT-5 gets the schema through the API instead). Here: take the
-        first JSON value in the reply (fences or prose around it allowed); a list, when the schema has exactly
-        one field and it is a list (NerRawOutput.named_entities, TripleRawOutput.triples), becomes that field;
+        first JSON value in the reply (fences or prose around it allowed); a list, when every field of the schema
+        is a list, becomes the first field (NerRawOutput.named_entities, TripleRawOutput.triples, and
+        SemanticRawOutput.semantic_triples when Qwen leaves out episodic_evidence), the others empty;
         non-string scalars inside string-list fields (e.g. ["faucet", "is on", true]) are made strings.
 
         Raises:
@@ -548,10 +549,11 @@ class Qwen3VLModel:
             logger.warning(f"No JSON in {len(response)}-char reply: {response[:150]!r} ... {response[-150:]!r}")
             raise Qwen3VLModelError(f"Failed to parse response as JSON: {response[:200]!r}")
         fields = text_format.model_fields
-        if isinstance(data, list) and len(fields) == 1:
-            (name, field), = fields.items()
-            if get_origin(field.annotation) in (list, List):
-                data = {name: data}
+        if isinstance(data, list) and all(get_origin(f.annotation) in (list, List) for f in fields.values()):
+            # a bare list is the first field; any other list fields are empty (SemanticRawOutput: Qwen sometimes
+            # returns only the triples, without episodic_evidence; dropping the reply would lose the whole group)
+            names = list(fields)
+            data = {names[0]: data, **{n: [] for n in names[1:]}}
         try:
             return text_format.model_validate(data)
         except Exception:
