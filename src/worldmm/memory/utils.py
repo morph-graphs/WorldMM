@@ -39,6 +39,7 @@ class QAResult:
     retrieved_items: List[RetrievedItem]
     round_history: List[Dict[str, Any]]
     num_rounds: int
+    trace: List[Dict[str, Any]] = field(default_factory=list)   # EPIC-Morph port: each search's memory walk (logging)
 
 
 def transform_timestamp(ts_str: str) -> str:

@@ -317,6 +317,7 @@ class VisualMemory:
             For text query: List of VideoClipEntry objects (or Dict if as_context=True)
         """
         # Check if query is a time range
+        self.last_trace = {"time_range": _is_time_range_query(query), "clips": []}   # EPIC-Morph port (logging only)
         if _is_time_range_query(query):
             frames = self._retrieve_by_time_range(
                 time_range=query,
@@ -389,6 +390,7 @@ class VisualMemory:
         top_values, top_indices = torch.topk(similarities, k)
         
         results = [self.indexed_entries[idx] for idx in top_indices.cpu().tolist()]
+        self.last_trace["clips"] = list(zip(results, top_values.cpu().tolist()))
         
         if as_context:
             # Extract frames from all retrieved clips, organized by clip

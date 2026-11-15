@@ -290,6 +290,7 @@ class EpisodicMemory:
         
         # Retrieve from each granularity level using HippoRAG
         all_candidates: List[Tuple[CaptionEntry, float]] = []
+        self.last_trace = {"granularities": []}   # EPIC-Morph port (logging only): what this call walked
 
         def granularity_top_k(granularity):
             if isinstance(top_k_per_granularity, dict):
@@ -310,6 +311,7 @@ class EpisodicMemory:
             
             # Convert retrieved docs back to CaptionEntry
             retrieved_docs = retrieval_result[0].docs
+            n_before = len(all_candidates)
             retrieved_scores = retrieval_result[0].doc_scores if hasattr(retrieval_result[0], 'doc_scores') else [1.0] * len(retrieved_docs)
             
             count = 0
@@ -325,6 +327,8 @@ class EpisodicMemory:
                 
                 all_candidates.append((entry, score))
                 count += 1
+            self.last_trace["granularities"].append({"granularity": granularity, **getattr(self.hipporag[granularity], "last_trace", {}),
+                                                     "candidates": all_candidates[n_before:]})
         
         if not all_candidates:
             logger.warning("No candidates retrieved from any granularity level")
@@ -336,6 +340,7 @@ class EpisodicMemory:
             candidates=all_candidates,
             final_top_k=final_top_k,
         )
+        self.last_trace["selected"] = [e.id for e in filtered_entries]
         
         if as_context:
             return self.retrieve_captions_as_str(filtered_entries)

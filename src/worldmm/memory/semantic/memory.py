@@ -285,6 +285,9 @@ class SemanticMemory:
         top_values, top_pos_indices = torch.topk(similarities, top_k_sim)
         
         top_sim_entries = [self.indexed_entries[pos] for pos in top_pos_indices.cpu().tolist()]
+        # EPIC-Morph port (logging only): the triples that seeded PPR (with their query similarity), its seed entities
+        # and the triples it ranked (with their PPR score)
+        self.last_trace = {"seed_triples": list(zip(top_sim_entries, top_values.cpu().tolist())), "seed_entities": [], "ranked": []}
         
         # Extract entities from top similar triples for PPR personalization
         personalization_entities: Set[str] = set()
@@ -295,6 +298,7 @@ class SemanticMemory:
             if obj:
                 personalization_entities.add(obj)
         
+        self.last_trace["seed_entities"] = sorted(personalization_entities)
         if not personalization_entities:
             # Fallback: return top similar triples by embedding similarity
             if as_context:
@@ -334,6 +338,7 @@ class SemanticMemory:
             key=lambda e: triple_scores.get(e.id, 0.0),
             reverse=True
         )[:top_k]
+        self.last_trace["ranked"] = [(e, triple_scores.get(e.id, 0.0)) for e in sorted_entries]
         
         if as_context:
             return self.retrieve_triples_as_str(sorted_entries)

@@ -20,6 +20,14 @@ from .utils import *
 
 logger = logging.getLogger(__name__)
 
+TRACE_LABEL, TRACE_MAX = 80, 30   # EPIC-Morph port: label characters and list entries per trace step (caps)
+
+
+def _secs(ts) -> int:
+    """A DHHMMSSFF timestamp (day + HHMMSSFF) -> seconds since DAY1 00:00:00."""
+    s = str(int(ts)).zfill(9)
+    return (int(s[0]) - 1) * 86400 + int(s[1:3]) * 3600 + int(s[3:5]) * 60 + int(s[5:7])
+
 
 class WorldMemory:
     """
@@ -314,6 +322,7 @@ Retrieved:
             if len(new_items) >= top_k:
                 break
         
+        self._shown = [e.id for e in new_items]   # EPIC-Morph port (logging only)
         # Format as context string
         content = self.episodic_memory.retrieve_captions_as_str(new_items)
         return content, retrieved_set
@@ -361,6 +370,7 @@ Retrieved:
             if len(new_items) >= top_k:
                 break
         
+        self._shown = [e.id for e in new_items]   # EPIC-Morph port (logging only)
         # Format as context string
         content = self.semantic_memory.retrieve_triples_as_str(new_items)
         return content, retrieved_set
@@ -405,6 +415,32 @@ Retrieved:
         # Fallback for unexpected return type
         return {}, retrieved_set
     
+    def _walk_step(self, memory_type: str, shown) -> Dict[str, Any]:
+        """EPIC-Morph port (logging only): what the last search of `memory_type` walked, compactly. Episodic: per
+        granularity HippoRAG's PPR seeds (entity phrases, weights), the facts kept by the recognition filter
+        (graph edges [subject, predicate, object, score]) and the captions PPR ranked (id, seconds, short text,
+        PPR score), then the ids the LLM filter selected. Semantic: the seed triples (query similarity), seed
+        entities and the triples PPR ranked (edges, with their consolidation time). Visual: the clips and their
+        similarity. `shown`: the ids (clip time ranges for visual) that reached the context."""
+        cap = lambda xs: list(xs)[:TRACE_MAX]
+        if memory_type == "episodic":
+            t = getattr(self.episodic_memory, "last_trace", {})
+            cap_node = lambda e, s: {"id": e.id, "gran": e.granularity, "t": [_secs(x) for x in e.timestamp_int],
+                                     "label": e.text[:TRACE_LABEL], "ppr": round(float(s), 6)}
+            return {"granularities": [{"granularity": g["granularity"], "dpr_only": g.get("dpr_only"),
+                                       "seeds": dict(cap(g.get("seeds", {}).items())), "edges": cap(g.get("facts", [])),
+                                       "nodes": [cap_node(e, s) for e, s in cap(g["candidates"])]}
+                                      for g in t.get("granularities", [])],
+                    "selected": t.get("selected", []), "shown": shown}
+        if memory_type == "semantic":
+            t = getattr(self.semantic_memory, "last_trace", {})
+            edge = lambda e, s, k: {"id": e.id, "edge": [e.subject, e.predicate, e.object], "t": _secs(e.timestamp), k: round(float(s), 6)}
+            return {"seed_entities": cap(t.get("seed_entities", [])), "seeds": [edge(e, s, "sim") for e, s in cap(t.get("seed_triples", []))],
+                    "edges": [edge(e, s, "ppr") for e, s in cap(t.get("ranked", []))], "shown": shown}
+        t = getattr(self.visual_memory, "last_trace", {})
+        return {"time_range": t.get("time_range"), "shown": shown,
+                "nodes": [{"id": e.id, "t": [_secs(x) for x in e.timestamp_int], "sim": round(float(s), 4)} for e, s in cap(t.get("clips", []))]}
+
     def answer(
         self,
         query: str,
@@ -441,6 +477,7 @@ Retrieved:
         retrieved_set: Set[str] = set()
         retrieved_items: List[RetrievedItem] = []
         round_history: List[Dict[str, Any]] = []
+        trace: List[Dict[str, Any]] = []   # EPIC-Morph port: each search's memory walk (logging only)
         
         # Get reasoning prompt template
         reasoning_prompt = self.prompt_template_manager.render("memory_reasoning")
@@ -499,6 +536,9 @@ Step 2 (only if search): Pick one memory type (episodic/semantic/visual) and for
                 # Retrieve from selected memory
                 content = ""
                 images = None
+                for m in (self.episodic_memory, self.semantic_memory, self.visual_memory):
+                    m.last_trace = {}   # EPIC-Morph port: no stale walk from an earlier search
+                self._shown = []
                 
                 if memory_type == "episodic":
                     content, retrieved_set = self.retrieve_from_episodic(
@@ -554,6 +594,11 @@ Step 2 (only if search): Pick one memory type (episodic/semantic/visual) and for
                 })
                 if memory_type == "visual":   # EPIC-Morph port: which clips (time ranges), for evidence scoring
                     round_history[-1]["retrieved_clips"] = list(images.keys()) if images else []
+                try:   # EPIC-Morph port: logging must never change the answer
+                    walk = self._walk_step(memory_type, list(images.keys()) if memory_type == "visual" and images else self._shown)
+                except Exception as e:
+                    walk = {"error": f"{type(e).__name__}: {e}"[:200]}
+                trace.append({"step": round_num, "memory": memory_type, "query": search_query, **walk})
         
         # Generate final answer
         logger.info("Generating answer from accumulated context")
@@ -592,6 +637,7 @@ Step 2 (only if search): Pick one memory type (episodic/semantic/visual) and for
             retrieved_items=retrieved_items,
             round_history=round_history,
             num_rounds=round_num,
+            trace=trace,
         )
     
     def reset_index(self) -> None:

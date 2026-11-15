@@ -371,6 +371,7 @@ class HippoRAG:
         for q_idx, query in tqdm(enumerate(queries), desc="Retrieving", total=len(queries)):
             query_fact_scores = self.get_fact_scores(query)
             top_k_fact_indices, top_k_facts, rerank_log = self.rerank_facts(query, query_fact_scores)
+            self._last_seeds = {}
 
             if len(top_k_facts) == 0:
                 logger.info('No facts found after reranking, return DPR results')
@@ -386,6 +387,11 @@ class HippoRAG:
             top_k_docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in sorted_doc_ids[:num_to_retrieve]]
 
             retrieval_results.append(QuerySolution(question=query, docs=top_k_docs, doc_scores=sorted_doc_scores[:num_to_retrieve]))
+            # EPIC-Morph port (logging only): the facts kept after the recognition filter (graph edges subject,
+            # predicate, object, with their query score) and the entity phrases that seeded PPR, with their weights
+            self.last_trace = {"dpr_only": len(top_k_facts) == 0, "seeds": self._last_seeds,
+                               "facts": [[*map(str, f), round(float(query_fact_scores[i] if query_fact_scores.ndim > 0 else query_fact_scores), 4)]
+                                         for f, i in zip(top_k_facts, top_k_fact_indices)]}
 
         # Evaluate retrieval
         if gold_docs is not None:
@@ -1158,6 +1164,7 @@ class HippoRAG:
             phrase_weights, linking_score_map = self.get_top_k_weights(link_top_k,
                                                                            phrase_weights,
                                                                            linking_score_map)  # at this stage, the length of linking_scope_map is determined by link_top_k
+        self._last_seeds = {p: round(float(w), 4) for p, w in linking_score_map.items()}   # EPIC-Morph port: PPR's entity seeds
 
         #Get passage scores according to chosen dense retrieval model
         dpr_sorted_doc_ids, dpr_sorted_doc_scores = self.dense_passage_retrieval(query)
